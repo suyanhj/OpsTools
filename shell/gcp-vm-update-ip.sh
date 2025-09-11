@@ -22,10 +22,8 @@ new_name=$base_name
 #new_name=$base_name
 
 urls='
-  https://app.airtelbank.com:5055/mobgw2/mobileswitch/api/v1/upi/customer/vpa/
-  https://app.airtelbank.com:5055/mobgw2/mobileswitch/api/v1/upi/transactions/new
+  https://qq.com
 '
-# https://app.airtelbank.com:5055//mobgw2/mobileswitch//api/v2/upi/txn/history
 ua="User-Agent: Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.90 Mobile Safari/537.36"
 
 
