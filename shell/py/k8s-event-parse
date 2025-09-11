@@ -1,0 +1,244 @@
+from kubernetes import client, watch, config
+import logging
+import urllib3
+import time
+import re
+from zoneinfo import ZoneInfo
+import logging
+import requests
+import os
+from kubernetes.client.exceptions import ApiException
+
+
+def args_check():
+    if not namespaces:
+        raise ValueError("请提供有效的命名空间")
+
+
+class K8sEventWatch(object):
+    def __init__(self, api_server, token, ns, tg_bots=None, kubeconfig=None):
+        """
+        初始化 Kubernetes 客户端工具类
+        :param api_server: Kubernetes API 地址
+        :param ns: 要操作的命名空间列表
+        :param token: Bearer Token
+        """
+        self.api_server = api_server
+        self.token = token
+        self.namespace = ns
+        self.regx = re.compile(
+            r"^New size:\s*(\d+);\s+reason:\s+(?:(cpu|memory)|external metric (s\d+[-\w]*)).*\)(.*)"
+        )
+        self.tg_bots = tg_bots
+        self.msg_queue = []
+        self.kubeconfig = kubeconfig
+        self.client = self.get_client()
+
+    def get_client(self):
+        """
+        构造 Kubernetes ApiClient 对象：
+        1. 优先使用 Token + ApiServer
+        2. 其次使用 kubeconfig 文件
+        3. 最后尝试集群内 ServiceAccount
+        """
+        if self.token:
+            configuration = client.Configuration()
+            configuration.host = self.api_server
+            configuration.verify_ssl = False
+            configuration.api_key = {"authorization": "Bearer " + self.token}
+            logging.info("使用 Token + ApiServer 认证")
+            return client.ApiClient(configuration=configuration)
+
+        if self.kubeconfig:
+            logging.info(f"使用 kubeconfig 文件: {self.kubeconfig}")
+            config.load_kube_config(config_file=self.kubeconfig)
+            return client.ApiClient()
+
+        try:
+            logging.info("未提供 token 或 kubeconfig，尝试使用 InCluster 配置")
+            config.load_incluster_config()
+            return client.ApiClient()
+        except Exception as e:
+            raise RuntimeError("无法初始化 Kubernetes Client") from e
+
+    def get_core_v1_client(self):
+        """获取 CoreV1Api 客户端用于 Node 等操作"""
+        return client.CoreV1Api(self.client)
+
+    def get_crd_client(self):
+        """获取 CustomObjectsApi 客户端用于 CRD 操作"""
+        return client.CustomObjectsApi(self.client)
+
+    @staticmethod
+    def time_format(ts):
+        """
+        将 ISO 格式 UTC 时间 string 转换为 Asia/Shanghai 可读时间
+        返回格式：YYYY-MM-DD HH:MM:SS
+        """
+        # return ts.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        return ts.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
+    def watch_namespace_events(self):  # pyright: ignore[reportUnreachable]
+        if not self.namespace:
+            logging.error("未指定命名空间，无法监听事件")
+            raise ValueError("未指定命名空间，无法监听事件")
+
+        v1 = self.get_core_v1_client()
+        
+        w = watch.Watch()
+
+        logging.info("监听")
+
+        while True:
+            events = v1.list_namespaced_event(namespace=self.namespace)
+            rv = events.metadata.resource_version
+            try:
+                for event in w.stream(
+                    v1.list_namespaced_event,
+                    namespace=self.namespace,
+                    resource_version=rv,
+                    timeout_seconds=300,
+                ):
+                    obj = event["object"]
+                    e_type = obj.type
+                    reason = obj.reason
+                    involved = obj.involved_object
+                    res_kind = involved.kind
+                    res_name = involved.name
+                    rv = obj.metadata.resource_version
+
+                    if (
+                        res_kind == "HorizontalPodAutoscaler"
+                        and e_type == "Normal"
+                        and reason == "SuccessfulRescale"
+                    ):
+                        logging.info("=" * 30)
+                        self.get_scale_reason(
+                            res_name, obj.message, timestamp=obj.last_timestamp
+                        )
+            except ApiException as e:
+                if e.status == 410:
+                    logging.warning("resourceVersion 过期，重新 list 一次")
+                    rv = v1.list_namespaced_event(
+                        namespace=self.namespace
+                    ).metadata.resource_version
+                    continue
+                else:
+                    logging.error(
+                        f"ApiException 捕获: status={e.status}, body={e.body}"
+                    )
+                    time.sleep(5)
+
+            except Exception as e:
+                logging.error(f"未知异常: {e}", exc_info=True)
+                time.sleep(5)
+
+    def get_scale_reason(self, hpa_name, reason_msg, **kwargs):
+        so_name = hpa_name.replace("keda-hpa-", "")
+        crd_client = self.get_crd_client()
+
+        result = self.regx.match(reason_msg)
+        if result:
+            reps, _1, _2, reason = result.groups()
+            if _1:
+                scale_type = _1
+            else:
+                _ = _2.split("-")
+                scale_type = _[1]
+
+            reason = reason.strip()
+            if reason in "above target":
+                self.msg_queue.append("[扩容事件]")
+            else:
+                self.msg_queue.append("[缩容事件]")
+
+            so = crd_client.get_namespaced_custom_object(
+                group="keda.sh",
+                version="v1alpha1",
+                namespace=self.namespace,
+                plural="scaledobjects",
+                name=so_name,
+            )
+            triggers = so["spec"]["triggers"]
+            for trigger in triggers:
+                name = trigger.get("name")
+                trigger_type = trigger.get("type")
+
+                if scale_type in trigger_type:
+                    self.add_msg(f"so: {so_name}")
+                    self.add_msg(f"触发器: {name}")
+                    self.add_msg(f"触发器类型: {trigger_type}")
+                    self.add_msg(
+                        f"原因: {name} {reason}, autoscale replicas to: {reps}"
+                    )
+                    self.add_msg(f'时间: {self.time_format(kwargs.get("timestamp"))}')
+                    break
+        else:
+            logging.warning(f"无法匹配: {reason_msg}")
+
+        self.send_tg_msg("\n".join(self.msg_queue))
+        self.msg_queue.clear()
+
+    def send_tg_msg(self, msg):
+        if not self.tg_bots:
+            return
+        if not msg:
+            return
+
+        with requests.Session() as session:
+            for bot in self.tg_bots:
+                bot_token = bot["bot_token"]
+                for chat_id in bot["chat_ids"]:
+                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    payload = {"chat_id": int(chat_id), "text": msg}
+                    try:
+                        resp = session.post(url, data=payload)
+                        resp_text = resp.text
+                        logging.info(
+                            f"Telegram push to {chat_id}: {resp.status_code} {resp_text}"
+                        )
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to send Telegram alert to {chat_id}: {e}",
+                            exc_info=True,
+                        )
+
+    def add_msg(self, msg):
+        logging.info(msg)
+        self.msg_queue.append(msg)
+
+
+if __name__ == "__main__":
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    RUN_ENV = os.getenv("RUN_ENV", "")
+    if RUN_ENV == "prod":
+        api_srv = os.getenv("API_SRV")
+        api_token = os.getenv("API_TOKEN")
+        namespaces = os.getenv("NS", "")
+    else:
+        api_srv = ""
+        api_token = ""
+        namespaces = "default
+
+    tg_token = os.getenv(
+        "TG_TOKEN", ""
+    )
+
+    tg_bots = [
+        {"bot_token": tk, "chat_ids": list(map(int, ids_str.split(",")))}
+        for tk, ids_str in (_.split(",", 1) for _ in tg_token.split(";") if _)
+    ]
+
+    args_check()
+    k8s_tools = K8sEventWatch(api_srv, api_token, namespaces, tg_bots)
+    try:
+        k8s_tools.watch_namespace_events()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(e, exc_info=True)
