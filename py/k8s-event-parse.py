@@ -223,7 +223,7 @@ if __name__ == "__main__":
     else:
         api_srv = ""
         api_token = ""
-        namespaces = "default
+        namespaces = "default"
 
     tg_token = os.getenv(
         "TG_TOKEN", ""
