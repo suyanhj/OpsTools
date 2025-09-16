@@ -571,3 +571,13 @@ if __name__ == '__main__':
             logging.error(exc_info=True)
     else:
         parser.error('必须指定 -m 或 -e')
+
+##### 运行
+#export Ali_Key=""
+#export Ali_Secret=""
+#acme.sh --issue \
+# --dns dns_ali \
+# -d example.com \
+# -d '*.example.com' \
+# --server letsencrypt \
+#  --renew-hook "cd /opt/scripts/ ;python3 cert-update.py -e prod -n mg"
